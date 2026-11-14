@@ -4,7 +4,7 @@
 
 本仓库用于学习 GPT-2, 使用 Python / Transformers / PyTorch. 当前代码仍处于初始阶段.
 
-- `src/learn_gpt2/`: Python 包. `__init__.py` 中的 `main()` 是命令行入口, 当前仅输出问候信息.
+- `src/learn_gpt2/`: Python 包. `__init__.py` 中的 `main()` 是命令行入口, 调用 `pipeline.py` 中的交互式文本生成循环.
 - `gpt2_hf.ipynb`: 根目录中的实验笔记本. 将可复用逻辑放入包中, 让笔记本专注于实验与展示.
 - `pyproject.toml`: 项目元数据, 依赖, 构建配置与硬件后端配置.
 - `uv.lock`: 依赖锁文件. 修改依赖时同步更新.
@@ -23,12 +23,14 @@
 - `uv run learn-gpt2`: 运行已配置的命令行入口.
 - `uv run jupyter lab`: 启动本地笔记本开发环境.
 - `uv build`: 使用 `uv_build` 构建源码包与 wheel.
+- `uv run ruff check`: 对 `.py` 与 `.ipynb` 运行 lint; 加 `--fix` 自动修复可修复的问题.
+- `uv run ruff format`: 格式化 `.py` 与 `.ipynb`; 加 `--check` 仅检查不修改.
 
 三个硬件后端互斥, 只选择一个. 不需要 PyTorch 的操作可仅安装基础依赖.
 
 ## 代码风格与命名
 
-Python 使用 4 个空格缩进, 保持现有双引号风格. 函数和变量使用 `snake_case`, 类使用 `PascalCase`, 常量使用 `UPPER_SNAKE_CASE`. 新增函数应提供清晰的类型注解, 与现有 `main() -> None` 保持一致. 当前未配置格式化或 lint 工具; 不要声称相关检查已启用.
+Python 使用 4 个空格缩进, 保持现有双引号风格. 函数和变量使用 `snake_case`, 类使用 `PascalCase`, 常量使用 `UPPER_SNAKE_CASE`. 新增函数应提供清晰的类型注解, 与现有 `main() -> None` 保持一致. 使用 Ruff 作为 lint 与格式化工具, 配置位于 `pyproject.toml` 的 `[tool.ruff]`, 行宽 100, 同时覆盖 `.py` 与 `.ipynb`. `ruff` 在 `dev` 依赖组中, `uv sync` 默认安装. 提交前确保 `uv run ruff check` 与 `uv run ruff format --check` 通过. 当前未配置 pre-commit 或 CI; 不要声称相关检查会自动执行.
 
 ## 测试与验证
 
