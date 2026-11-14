@@ -36,4 +36,10 @@ Python 使用 4 个空格缩进, 保持现有双引号风格. 函数和变量使
 
 ## 提交与 Pull Request
 
-仓库尚无提交历史, 因此没有可沿用的提交格式. 使用简短的祈使句说明具体改动, 每个提交聚焦一个目的. PR 应说明改动目的, 涉及的模块, 实际执行的验证命令及结果. 涉及 GPU 行为时注明硬件后端; 有关联 issue 时附链接. 不要提交 `.venv/`, 密钥, 下载的模型权重或大型实验输出.
+提交信息必须遵循 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/), 格式为 `<type>[optional scope][!]: <description>`. 类型后必须有冒号和空格; scope 和 `!` 可省略.
+
+- 新功能使用 `feat`, 缺陷修复使用 `fix`. 其他常用类型包括 `docs` / `chore` / `refactor` / `test` / `build` / `ci`.
+- 类型统一使用小写. 描述沿用现有提交的英文祈使句风格, 每个提交聚焦一个目的. 例如: `docs: update project README` 或 `fix(cli): handle invalid arguments`.
+- 不兼容变更必须在冒号前加 `!`, 或在 footer 中使用 `BREAKING CHANGE: <description>` 标记. 正文和 footer 为可选项, 与前面的内容用空行分隔.
+
+PR 应说明改动目的, 涉及的模块, 实际执行的验证命令及结果. 涉及 GPU 行为时注明硬件后端; 有关联 issue 时附链接. 不要提交 `.venv/`, 密钥, 下载的模型权重或大型实验输出.
