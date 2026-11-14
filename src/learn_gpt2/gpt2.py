@@ -32,6 +32,63 @@ _TRANSPOSED_WEIGHTS = (
 )
 
 
+class LayerKVCache:
+    """Key/value buffers of one attention layer, appended to as tokens are decoded.
+
+    Buffers are allocated lazily on the first update so they match the batch size, dtype and
+    device of the activations. ``length`` counts the positions already stored.
+    """
+
+    def __init__(self, max_len: int):
+        self.max_len = max_len
+        self.length = 0
+        self.k: torch.Tensor | None = None  # (B, nh, max_len, hs)
+        self.v: torch.Tensor | None = None  # (B, nh, max_len, hs)
+
+    def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append ``k`` and ``v`` of shape (B, nh, T, hs); return all cached keys and values."""
+        B, nh, T, hs = k.shape
+        end = self.length + T
+        if end > self.max_len:
+            raise ValueError(f"KV cache overflow: {end} positions exceed max_len {self.max_len}")
+        if self.k is None or self.v is None:
+            self.k = k.new_empty(B, nh, self.max_len, hs)
+            self.v = v.new_empty(B, nh, self.max_len, hs)
+        else:
+            # Slice assignment would silently broadcast or cast mismatched activations.
+            cached = (self.k.size(0), self.k.size(1), self.k.size(3), self.k.dtype, self.k.device)
+            new = (B, nh, hs, k.dtype, k.device)
+            if new != cached:
+                raise ValueError(
+                    "KV cache mismatch: (batch, heads, head_size, dtype, device) is "
+                    f"{cached} in the cache but {new} for the new tokens"
+                )
+        self.k[:, :, self.length : end] = k
+        self.v[:, :, self.length : end] = v
+        self.length = end
+        return self.k[:, :, :end], self.v[:, :, :end]
+
+
+class KVCache:
+    """Per-layer key/value caches that let decoding feed only the new tokens to the model.
+
+    Without a cache, every decoding step recomputes keys and values for the whole prefix, so
+    generating N tokens costs O(N^2) token forwards. With a cache, each step only runs the
+    newest token through the network and attends to the stored keys and values.
+    """
+
+    def __init__(self, n_layer: int, max_len: int):
+        self.layers = [LayerKVCache(max_len) for _ in range(n_layer)]
+
+    @property
+    def length(self) -> int:
+        return self.layers[0].length
+
+    @property
+    def max_len(self) -> int:
+        return self.layers[0].max_len
+
+
 class CausalSelfAttention(torch.nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
@@ -41,14 +98,27 @@ class CausalSelfAttention(torch.nn.Module):
         self.c_attn = torch.nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = torch.nn.Linear(config.n_embd, config.n_embd)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: LayerKVCache | None = None) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        if kv_cache is not None:
+            k, v = kv_cache.update(k, v)  # (B, nh, L, hs), L = cached + T
+        L = k.size(2)
+        if T == L:
+            # No earlier positions: plain causal attention.
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif T == 1:
+            # A single new token may attend to every cached position.
+            y = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # Query i sits at absolute position L - T + i and sees keys up to that position.
+            # is_causal=True would align the mask to the top-left corner, which is wrong here.
+            mask = torch.ones(T, L, dtype=torch.bool, device=x.device).tril(diagonal=L - T)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         return self.c_proj(y)
 
 
@@ -71,8 +141,8 @@ class Block(torch.nn.Module):
         self.ln_2 = torch.nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x: torch.Tensor, kv_cache: LayerKVCache | None = None) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), kv_cache)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -108,20 +178,76 @@ class GPT2(torch.nn.Module):
         elif isinstance(module, torch.nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, kv_cache: KVCache | None = None) -> torch.Tensor:
+        """Return logits for ``idx``.
+
+        With ``kv_cache``, ``idx`` holds only the tokens that are not cached yet; they are placed
+        after the cached positions, and their keys and values are appended to the cache.
+        """
         B, T = idx.shape
-        assert T <= self.block_size, (
-            f"Cannot forward sequence of length {T}, block size is only {self.block_size}"
+        start = 0
+        if kv_cache is not None:
+            if len(kv_cache.layers) != len(self.transformer.h):
+                raise ValueError(
+                    f"KV cache has {len(kv_cache.layers)} layers, "
+                    f"model has {len(self.transformer.h)}"
+                )
+            start = kv_cache.length
+        assert start + T <= self.block_size, (
+            f"Cannot forward sequence of length {start + T}, block size is only {self.block_size}"
         )
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos = torch.arange(start, start + T, dtype=torch.long, device=idx.device)
         tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
         pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
         x = tok_emb + pos_emb
-        for block in self.transformer.h:
-            x = block(x)
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, kv_cache.layers[i] if kv_cache is not None else None)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
         return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        """Extend ``idx`` of shape (B, T) by ``max_new_tokens`` sampled tokens.
+
+        ``temperature=0`` decodes greedily. With ``use_cache``, the prompt is run once to fill a
+        KV cache and each later step feeds only the newest token. Learned absolute position
+        embeddings cap the context at ``block_size``; once the sequence outgrows it, cached
+        positions would shift, so generation falls back to recomputing the cropped context.
+        """
+        B, T = idx.shape
+        kv_cache = (
+            KVCache(self.config.n_layer, min(T + max_new_tokens, self.block_size))
+            if use_cache
+            else None
+        )
+        for _ in range(max_new_tokens):
+            if kv_cache is not None and idx.size(1) > kv_cache.max_len:
+                kv_cache = None
+            if kv_cache is None:
+                logits = self(idx[:, -self.block_size :])
+            else:
+                logits = self(idx[:, kv_cache.length :], kv_cache)
+            logits = logits[:, -1, :]  # (B, vocab_size)
+            if temperature == 0:
+                next_token = logits.argmax(dim=-1, keepdim=True)  # (B, 1)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    kth = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values[:, [-1]]
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            idx = torch.cat((idx, next_token), dim=1)
+        return idx
 
     @classmethod
     def from_pretrained(cls, model_type: str, *, dtype: torch.dtype = torch.float32) -> GPT2:
