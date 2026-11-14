@@ -5,6 +5,11 @@ import torch
 from transformers import Pipeline, TextStreamer, pipeline
 
 DEFAULT_MODEL = "gpt2"
+DTYPES: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
 EXIT_COMMANDS = frozenset({"exit", "quit", ":q"})
 
 
@@ -17,8 +22,8 @@ def select_device() -> torch.device:
     return torch.device("cpu")
 
 
-def build_pipeline(model_name: str, device: torch.device) -> Pipeline:
-    return pipeline("text-generation", model=model_name, device=device)
+def build_pipeline(model_name: str, device: torch.device, dtype: torch.dtype) -> Pipeline:
+    return pipeline("text-generation", model=model_name, device=device, dtype=dtype)
 
 
 def generate(
@@ -76,6 +81,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Interactively run GPT-2 text generation on prompts read from stdin.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="model name or local path")
+    parser.add_argument(
+        "--dtype",
+        choices=DTYPES,
+        default="fp32",
+        help="precision to load and run the model in",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(
         "--temperature",
@@ -98,6 +109,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.seed is not None:
         torch.manual_seed(args.seed)
     device = select_device()
-    print(f"Loading {args.model} on {device}...")
-    generator = build_pipeline(args.model, device)
+    print(f"Loading {args.model} ({args.dtype}) on {device}...")
+    generator = build_pipeline(args.model, device, DTYPES[args.dtype])
     run_repl(generator, args.max_new_tokens, args.temperature, args.top_p)
