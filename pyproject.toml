@@ -1,0 +1,56 @@
+[project]
+name = "learn-gpt2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "huahang", email = "huahang.liu@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "transformers>=4.57",
+    "jupyterlab>=4.4",
+    "notebook>=7.4",
+    "voila>=0.5",
+    "ipywidgets>=8.1",
+]
+
+# Pick exactly one PyTorch backend:
+#   uv sync --extra cuda   # NVIDIA GPU (Linux / Windows)
+#   uv sync --extra rocm   # AMD GPU, e.g. Strix Halo (Linux)
+#   uv sync --extra mps    # Apple Silicon (macOS)
+[project.optional-dependencies]
+cuda = ["torch>=2.11"]
+rocm = ["torch>=2.11", "triton-rocm"]
+mps = ["torch>=2.11"]
+
+[project.scripts]
+learn-gpt2 = "learn_gpt2:main"
+
+[tool.uv]
+conflicts = [
+    [{ extra = "cuda" }, { extra = "rocm" }, { extra = "mps" }],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu132", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
