@@ -1303,9 +1303,7 @@ def close(board: Board) -> None:
         board.rect(88, top, 1744, 136, CARD, radius=16, line="2E2358")
         board.text(num, 116, top, 80, 136, 26, PURPLE, bold=True, align="center", valign="middle")
         board.text(text, 210, top, 1560, 136, 20, WHITE, valign="middle")
-    board.source(
-        "演示脚本：presentations/05-transformer-gpt2-gpt3/demo.py。代码：src/learn_gpt2/gpt2.py。"
-    )
+    board.source("演示脚本见本目录的 demo.py，GPT-2 实现见 src/learn_gpt2/gpt2.py。")
 
 
 def render() -> list[Path]:
