@@ -30,7 +30,9 @@ SOURCES = [
     "https://arxiv.org/pdf/1706.03762",
     "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf",
     "https://arxiv.org/pdf/2005.14165",
+    "https://github.com/openai/gpt-2/blob/master/src/model.py",
 ]
+SOURCE_PREFIXES = [("[1]", "Transformer"), ("[2]", "GPT-2"), ("[3]", "GPT-3"), ("[4]",)]
 OVERFLOWS: list[str] = []
 
 
@@ -81,8 +83,16 @@ class Board:
         self.data = data
         self.accent = (
             GOLD
-            if data["section"].startswith("02")
-            else (PURPLE if data["section"].startswith("03") else TEAL)
+            if data["section"].startswith(("02", "03"))
+            else (PURPLE if data["section"].startswith("04") else TEAL)
+        )
+        self.source_url = next(
+            (
+                url
+                for prefixes, url in zip(SOURCE_PREFIXES, SOURCES, strict=True)
+                if data["source"].startswith(prefixes)
+            ),
+            None,
         )
         self.slide.notes_slide.notes_text_frame.text = (
             data["narration"] + "\n\n来源：" + data["source"] + "\n" + "\n".join(SOURCES)
@@ -166,13 +176,8 @@ class Board:
             p.text = line
             p.font.name, p.font.size, p.font.bold = FONT_NAME, Pt(size / 2), bold
             p.font.color.rgb = color(fill)
-            if text == safe_text(self.data["source"]) and p.runs:
-                source_index = (
-                    1
-                    if self.data["section"].startswith("02")
-                    else (2 if self.data["section"].startswith("03") else 0)
-                )
-                p.runs[0].hyperlink.address = SOURCES[source_index]
+            if self.source_url and text == safe_text(self.data["source"]) and p.runs:
+                p.runs[0].hyperlink.address = self.source_url
             p.alignment = PP_ALIGN.CENTER if align == "center" else PP_ALIGN.LEFT
 
     def box(
@@ -297,12 +302,15 @@ def generic_bars(b: Board) -> None:
 
 
 def generic_prompt(b: Board) -> None:
-    is_gpt3 = b.data["section"].startswith("03")
+    is_gpt3 = b.data["section"].endswith("GPT-3")
     prompts = (
         [
-            ("ZERO-SHOT", "判断情感：\n文本：服务很周到\n标签：▯"),
-            ("ONE-SHOT", "糟透了 → 负面\n\n服务很周到 → ▯"),
-            ("FEW-SHOT", "糟透了 → 负面\n很喜欢 → 正面\n太失望 → 负面\n服务很周到 → ▯"),
+            ("零样本 · 0 条", "判断情感\n\n服务很周到 → ▯"),
+            ("单样本 · 1 条", "判断情感\n糟透了 → 负面\n\n服务很周到 → ▯"),
+            (
+                "少样本 · 3 条",
+                "判断情感\n糟透了 → 负面\n很喜欢 → 正面\n太失望 → 负面\n服务很周到 → ▯",
+            ),
         ]
         if is_gpt3
         else [
@@ -342,6 +350,48 @@ def matrix(b: Board, x: int, y: int, cell: int = 90, numbers: bool = False) -> N
             )
 
 
+def cached_row(b: Board) -> None:
+    for i, (heading, expression) in enumerate(b.data["panels"]):
+        x = 100 + 585 * i
+        b.rect(x, 345, 550, 295)
+        b.text(heading, x + 24, 392, 502, 65, 39, b.accent, True)
+        b.text(expression, x + 24, 495, 502, 122, 34)
+    b.text("新行的输出 ≈ (1.203, 1.593)", 100, 712, 1720, 90, 59, INK, True, "center")
+
+
+def cached_mask(b: Board) -> None:
+    cache_length = 2
+    cell_width = 196
+    left = 300
+    b.text("历史 K/V", left, 322, 2 * cell_width - 5, 60, 35, GOLD, True, "center")
+    b.text("本轮 K/V", left + 2 * cell_width, 322, 2 * cell_width - 5, 60, 35, TEAL, True, "center")
+    for j in range(4):
+        x = left + j * cell_width
+        b.text(f"位置 {j}", x, 392, cell_width - 5, 52, 31, MUTED, align="center")
+    for i in range(2):
+        absolute_position = cache_length + i
+        y = 453 + i * 132
+        b.text(f"查询 {absolute_position}", 100, y + 40, 184, 50, 33, INK, True)
+        for j in range(4):
+            x = left + j * cell_width
+            visible = j <= absolute_position
+            b.rect(x, y, cell_width - 5, 123, "1C4D50" if visible else "2F2439")
+            b.text(
+                "可见" if visible else "屏蔽",
+                x,
+                y + 39,
+                cell_width - 5,
+                53,
+                34,
+                TEAL if visible else RED,
+                True,
+                "center",
+            )
+    b.box("可见条件\n键位置 j ≤ C + i", 1170, 381, 650, 183, size=42)
+    b.box("本轮只有一个查询时\n它可以读取全部有效 K/V", 1170, 603, 650, 168, size=40)
+    b.text("C = 2，本轮查询 i = 0、1，对应绝对位置 2、3。", 100, 799, 1720, 49, 32)
+
+
 def special(b: Board) -> bool:
     k = b.data["kind"]
     if k == "cover":
@@ -357,7 +407,7 @@ def special(b: Board) -> bool:
             b.text(year, x + 30, 377, 470, 90, 67, [TEAL, GOLD, PURPLE][i], True)
             b.text(name, x + 30, 497, 480, 75, 53, INK, True)
             b.text(subtitle, x + 30, 626, 480, 80, 34, MUTED)
-        b.text("46 页中文讲解 · 机制 → 架构 → 实验 → 局限", 100, 798, 1720, 55, 34)
+        b.text("机制 → 架构 → 实验 · 含 KV Cache 手算和代码对照", 100, 798, 1720, 55, 34)
     elif k == "qkv":
         b.box("输入表示 X\n每个 token 一行", 100, 476, 430, 150, size=42)
         for i, (t, sub) in enumerate(
@@ -472,12 +522,16 @@ def special(b: Board) -> bool:
             b.arrow(1040, yy + 60, 1190, yy + 60)
             b.box(f"选出 {nxt}", 1240, yy, 530, 126, size=44)
     elif k == "kv":
-        b.box("每层历史缓存\nK₁ … Kₜ₋₁\nV₁ … Vₜ₋₁", 100, 380, 540, 300, size=45)
-        b.box("新 token\n生成 qₜ, kₜ, vₜ", 750, 380, 530, 170, size=42)
-        b.arrow(660, 595, 920, 595)
-        b.box("qₜ 读取\n历史 + 当前 K/V", 1350, 380, 470, 300, size=43)
-        b.arrow(1300, 465, 1340, 465)
-        b.box("缓存只省重算；历史注意力读取与显存占用仍随长度增长。", 100, 730, 1720, 100, size=35)
+        b.box("本层已缓存\n历史 K/V", 100, 350, 805, 150, size=42)
+        b.box("本层的新位置\n计算本轮的 Q、K、V", 1015, 350, 805, 150, size=42)
+        b.arrow(500, 516, 720, 587)
+        b.arrow(1420, 516, 1200, 587)
+        b.box("本轮 Q 读取历史与当前的 K/V", 370, 606, 1180, 115, size=43)
+        b.text("将本轮 K/V 写入该层缓存，供下一轮读取。", 100, 775, 1720, 54, 35, MUTED)
+    elif k == "kv_row":
+        cached_row(b)
+    elif k == "kv_mask":
+        cached_mask(b)
     elif k == "multihead":
         for i in range(4):
             x = 100 + i * 440
@@ -532,7 +586,7 @@ def main() -> None:
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(W / SCALE), Inches(H / SCALE)
     prs.core_properties.title = "注意力机制、GPT-2 与 GPT-3 三篇论文综述"
-    prs.core_properties.subject = "因果自注意力、模型架构、训练与评测"
+    prs.core_properties.subject = "因果自注意力、KV Cache、模型架构、训练与评测"
     prs.core_properties.author = "learn-gpt2"
     images = []
     for index, slide in enumerate(data, 1):

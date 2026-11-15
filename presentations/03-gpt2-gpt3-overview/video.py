@@ -282,7 +282,11 @@ def render_video(manifest: dict[str, Any], args: argparse.Namespace) -> None:
     fonts = BUILD / "fonts"
     fonts.mkdir(exist_ok=True)
     if args.font and args.font.exists():
-        shutil.copy2(args.font, fonts / args.font.name)
+        target = fonts / args.font.name
+        if args.font.resolve() != target.resolve():
+            temporary = target.with_suffix(".tmp")
+            shutil.copyfile(args.font, temporary)
+            temporary.replace(target)
     elif not list(fonts.glob("*")):
         raise FileNotFoundError("A Chinese font is required: pass --font /path/to/msyh.ttc")
     shot_lines = []
@@ -308,6 +312,7 @@ def render_video(manifest: dict[str, Any], args: argparse.Namespace) -> None:
     shot_lines.append(f"file 'render/slide-{manifest['slide_count']:02d}.png'")
     (BUILD / "shots.txt").write_text("\n".join(shot_lines) + "\n", encoding="utf-8")
     (BUILD / "chapters.ffmeta").write_text("\n".join(chapter_lines) + "\n", encoding="utf-8")
+    rendered_video = BUILD / "overview.rendering.mp4"
     command = [
         args.ffmpeg,
         "-hide_banner",
@@ -338,8 +343,8 @@ def render_video(manifest: dict[str, Any], args: argparse.Namespace) -> None:
         "-metadata:s:a:0",
         "language=zho",
         "-vf",
-        f"fps={args.fps},drawbox=x=0:y=990:w=1920:h=90:color=0x080D16:t=fill,"
-        "ass=build/subtitles.ass:fontsdir=build/fonts,format=yuv420p",
+        "format=yuv420p,drawbox=x=0:y=990:w=1920:h=90:color=0x080D16:t=fill,"
+        f"fps={args.fps},ass=build/subtitles.ass:fontsdir=build/fonts",
         "-c:v",
         "libx264",
         "-preset",
@@ -362,9 +367,10 @@ def render_video(manifest: dict[str, Any], args: argparse.Namespace) -> None:
         str(manifest["duration_seconds"]),
         "-movflags",
         "+faststart",
-        "overview.mp4",
+        str(rendered_video),
     ]
     subprocess.run(command, cwd=HERE, check=True)
+    rendered_video.replace(HERE / "overview.mp4")
 
 
 async def main_async(args: argparse.Namespace) -> None:

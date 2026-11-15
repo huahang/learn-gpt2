@@ -85,7 +85,7 @@ uv build
 
 ## 论文讲解材料
 
-[注意力机制、GPT-2 与 GPT-3 三篇论文综述](presentations/03-gpt2-gpt3-overview/README.md)：中文综述、46 页 PPT、约 42 分钟配音视频和可运行的因果自注意力示例。
+三篇论文综述包含中文综述、54 页 PPT、约 49 分钟的普通话讲解和数值演示。视频从 05:11 讲因果自注意力，从 28:47 讲 KV Cache。[注意力机制、GPT-2 与 GPT-3 三篇论文综述](presentations/03-gpt2-gpt3-overview/README.md)
 
 [《展开讲讲 Causal Self Attention：GPT-2 因果自注意力》](presentations/04-gpt2-causal-self-attention/README.md)：17 页 PPT 与 12:30 中文配音视频，讲解 `src/learn_gpt2/gpt2.py` 的 `CausalSelfAttention`（L92-122）。
 

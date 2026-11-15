@@ -123,17 +123,21 @@ def full_forward(x: Array, layers: list[Layer], *, causal: bool = True) -> Array
     return hidden
 
 
-def incremental_forward(x: Array, layers: list[Layer]) -> Array:
-    """逐 token 计算，且为每层单独缓存 K/V；旧位置的 Q 不再使用。
-
-    固定权重、固定位置编号且无 dropout。第 t 步每层只处理一个新位置，
-    但这个位置读取该层 0..t 的全部缓存 K/V。模型与 full_forward 完全相同。
-    """
+def incremental_forward(
+    x: Array, layers: list[Layer], chunk_sizes: tuple[int, ...] | None = None
+) -> Array:
+    """依次处理若干新位置，为每层独立保存 K/V。默认逐 token 处理。"""
+    if chunk_sizes is None:
+        chunk_sizes = (1,) * len(x)
+    if sum(chunk_sizes) != len(x) or min(chunk_sizes, default=0) < 1:
+        raise ValueError("各块长度必须为正，且合计等于输入长度。")
     cached_keys = [np.empty((0, WIDTH), dtype=np.float64) for _ in layers]
     cached_values = [np.empty((0, WIDTH), dtype=np.float64) for _ in layers]
     outputs = []
-    for position in range(len(x)):
-        hidden = x[position : position + 1]
+    start = 0
+    for size in chunk_sizes:
+        end = start + size
+        hidden = x[start:end]
         for index, layer in enumerate(layers):
             normalized = layer_norm(hidden)
             query = normalized @ layer.query
@@ -145,11 +149,12 @@ def incremental_forward(x: Array, layers: list[Layer]) -> Array:
                 query,
                 cached_keys[index],
                 cached_values[index],
-                query_start=position,
+                query_start=start,
             )
             hidden = hidden + result.output @ layer.output
             hidden = hidden + gelu(layer_norm(hidden) @ layer.expand) @ layer.contract
         outputs.append(hidden)
+        start = end
     return np.concatenate(outputs, axis=0)
 
 
@@ -159,6 +164,24 @@ def max_difference(left: Array, right: Array) -> float:
 
 def show_matrix(name: str, values: Array) -> None:
     print(f"\n{name}\n{values}")
+
+
+def show_cached_example() -> None:
+    """复核课件里的手算结果与带偏移的可见矩阵。"""
+    queries = np.array([[1.0, 0], [0, 1], [1, 0]])
+    keys = np.array([[1.0, 0], [0, 1], [1, 1]])
+    values = np.array([[2.0, 0], [0, 4], [1, 2]])
+    cached = attention(queries[-1:], keys, values, query_start=2)
+    full = attention(queries, keys, values)
+    np.testing.assert_allclose(cached.output, full.output[-1:], atol=ATOL, rtol=0)
+    np.testing.assert_array_equal(np.round(cached.output, 3), [[1.203, 1.593]])
+    print(f"\n手算例的新行权重 {cached.weights[0]}，输出 {cached.output[0]}")
+
+    vectors = np.ones((4, 2), dtype=np.float64)
+    block_result = attention(vectors[2:], vectors, vectors, query_start=2)
+    visible = np.isfinite(block_result.mask).astype(int)
+    np.testing.assert_array_equal(visible, [[1, 1, 1, 0], [1, 1, 1, 1]])
+    show_matrix("缓存已有两项，一次追加两项时的可见矩阵", visible)
 
 
 def main() -> None:
@@ -206,13 +229,22 @@ def main() -> None:
     assert np.allclose(original_stack[:2], changed_stack[:2], atol=ATOL, rtol=0)
 
     cached_stack = incremental_forward(x, layers)
+    prefill_stack = incremental_forward(x, layers, (2, 1, 1))
+    chunked_stack = incremental_forward(x, layers, (2, 2))
     cache_error = max_difference(original_stack, cached_stack)
+    prefill_error = max_difference(original_stack, prefill_stack)
+    chunk_error = max_difference(original_stack, chunked_stack)
     assert np.allclose(original_stack, cached_stack, atol=ATOL, rtol=0)
+    assert np.allclose(original_stack, prefill_stack, atol=ATOL, rtol=0)
+    assert np.allclose(original_stack, chunked_stack, atol=ATOL, rtol=0)
     print("\n只修改未来的第 3、4 个 token 后：")
     print(f"  单层因果注意力：前两个位置最大变化 = {causal_error:.3e}")
     print(f"  无掩码注意力：  前两个位置最大变化 = {unmasked_change:.3e}")
     print(f"  两层因果堆叠：  前两个位置最大变化 = {stack_error:.3e}")
-    print(f"\n两层 full forward 与逐 token KV cache 最大差异 = {cache_error:.3e}")
+    print(f"\n两层整段前向与逐 token 缓存的最大差异 = {cache_error:.3e}")
+    print(f"两层整段前向与预填充、单项解码的最大差异 = {prefill_error:.3e}")
+    print(f"两层整段前向与分块缓存的最大差异 = {chunk_error:.3e}")
+    show_cached_example()
     print(f"全部断言通过：allclose 的 atol={ATOL:g}, rtol=0。")
     print("无掩码时一般会改变；特殊的输入或退化权重可能巧合不变。")
     print("这里验证的是确定性因果信息流，不代表对真实语言模型能力的评测。")
