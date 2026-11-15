@@ -1,2 +1,5 @@
 presentations/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
 presentations/**/*.pptx filter=lfs diff=lfs merge=lfs -text
+presentations/**/*.pdf filter=lfs diff=lfs merge=lfs -text
+presentations/**/*.png filter=lfs diff=lfs merge=lfs -text
+presentations/03-gpt2-gpt3-overview/review.html filter=lfs diff=lfs merge=lfs -text
