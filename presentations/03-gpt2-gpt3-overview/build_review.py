@@ -261,7 +261,7 @@ def main() -> None:
     title = re.search(r"^# (.+)$", source, re.MULTILINE).group(1)
     body = body.replace(
         "</h1>",
-        '</h1><div class="meta">三篇论文综述 · 因果自注意力重点讲解 · '
+        '</h1><div class="meta">三篇论文综述 · 因果自注意力与 KV Cache · '
         "包含手算例子、实验口径与自测练习</div>",
         1,
     )
