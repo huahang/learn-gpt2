@@ -4,9 +4,9 @@
 
 本仓库用于学习 GPT-2, 使用 Python / Transformers / PyTorch. 当前代码仍处于初始阶段.
 
-- `src/learn_gpt2/`: Python 包. `__init__.py` 中的 `main()` 是命令行入口, 调用 `pipeline.py` 中的交互式文本生成循环. `gpt2.py` 是自行实现的 GPT-2, 含推理用的 `KVCache` 与 `GPT2.generate()`.
+- `src/learn_gpt2/`: Python 包. `__init__.py` 中的 `main()` 是命令行入口, 调用 `pipeline.py` 中的交互式文本生成循环. `gpt2.py` 是自行实现的 GPT-2, 含推理用的 `KVCache` 与 `GPT2.generate()`. `qwen3.5_0.8b.py` 是自行实现的 Qwen3.5-0.8B 文本模型 (Gated DeltaNet 与全注意力混合), 结构与参数名同 HF `Qwen3_5ForCausalLM` 一致, 含 `HybridCache` 与 `Qwen3_5.from_pretrained()`; 文件名含点号, 需用 `importlib.util.spec_from_file_location` 加载 (见 `tests/test_qwen3_5.py`).
 - `presentations/`: 讲解材料 (PPT, 视频及其生成脚本). 其中 `*.mp4` 与 `*.pptx` 由 Git LFS 管理 (见 `.gitattributes`), 克隆后需 `git lfs install` 再 `git lfs pull`.
-- `gpt2_hf.ipynb`: 根目录中的实验笔记本. 将可复用逻辑放入包中, 让笔记本专注于实验与展示.
+- `gpt2_hf.ipynb` / `qwen3.5_0.8b.ipynb`: 根目录中的实验笔记本. 将可复用逻辑放入包中, 让笔记本专注于实验与展示.
 - `pyproject.toml`: 项目元数据, 依赖, 构建配置与硬件后端配置.
 - `uv.lock`: 依赖锁文件. 修改依赖时同步更新.
 - `README.md`: 当前为空, 新增使用流程时补充说明.
