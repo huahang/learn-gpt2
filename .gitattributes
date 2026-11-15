@@ -1,0 +1,2 @@
+presentations/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
+presentations/**/*.pptx filter=lfs diff=lfs merge=lfs -text
