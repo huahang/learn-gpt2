@@ -286,16 +286,25 @@ async def build() -> None:
         spoken = _duration(audio)
         total = spoken + PAD
         cues = _cues(boundaries, spoken)
-        print(f"encode {index:02d} {spoken:.1f}s {len(cues)} cues")
-        _encode_segment(index, cues, audio, total)
+        segment = _encode_segment(index, cues, audio, total)
+        # Concatenation keeps each file's encoded length, which frame rounding
+        # can move off the requested audio-plus-pad duration. Sidecars must use
+        # that encoded length or later chapters and subtitles drift early.
+        encoded = _duration(segment)
+        fitted = [
+            (start, min(end, encoded), text) for start, end, text in cues if start < encoded - 0.02
+        ]
+        print(
+            f"encode {index:02d} requested {total:.3f}s encoded {encoded:.3f}s {len(fitted)} cues"
+        )
         rows.append(
             {
                 "index": index,
                 "name": spec["draw"].__name__,
                 "title": titles[index - 1],
                 "narration": spec["narration"],
-                "duration": total,
-                "cues": cues,
+                "duration": encoded,
+                "cues": fitted,
             }
         )
     _write_sidecars(rows)
@@ -338,7 +347,9 @@ async def build() -> None:
             str(silent),
         ]
     )
-    print("duration", _duration(silent))
+    encoded_total = sum(row["duration"] for row in rows)
+    final = _duration(silent)
+    print(f"sidecar sum {encoded_total:.3f}s video {final:.3f}s")
 
 
 if __name__ == "__main__":

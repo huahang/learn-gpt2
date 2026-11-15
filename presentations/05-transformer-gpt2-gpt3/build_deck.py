@@ -139,7 +139,7 @@ def pattern_matrix(board: Board, x: float, y: float, tokens: list[str], cell: in
                 left, top + 6, cell - 12, cell - 12, PURPLE if allowed else BLOCKED, radius=10
             )
             board.text(
-                "看" if allowed else "∞",
+                "看" if allowed else "\u2212\u221e",
                 left,
                 top + 6,
                 cell - 12,
@@ -600,7 +600,7 @@ def mask_shape(board: Board) -> None:
     board.rect(88, 340, 760, 250, CARD, radius=16, line="2E2358")
     board.text("允许：j ≤ i，含对角线", 116, 362, 680, lh(16), 16, WHITE, bold=True)
     board.text("位置 i 读这些 Value，\n用来预测下一个词。", 116, 410, 680, lh(16, 2), 16, MUTED)
-    board.text("禁止：j > i，标成 ∞", 116, 520, 680, lh(16), 16, WHITE, bold=True)
+    board.text("禁止：j > i，标成 \u2212\u221e", 116, 520, 680, lh(16), 16, WHITE, bold=True)
     board.text("生成时这些词还不存在，\n训练时它们就是答案。", 116, 568, 680, lh(16, 2), 16, MUTED)
     pattern_matrix(board, 980, 175, demo.TOKENS, cell=100)
     board.source("形状是 T×T。本页四个词是教学例子，不是论文里的句子。")
