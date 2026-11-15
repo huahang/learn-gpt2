@@ -1,0 +1,8 @@
+# Independent teaching-media environment; does not change project training dependencies.
+-r requirements-video.txt
+python-pptx==1.0.2
+pillow==13.0.0
+numpy==2.5.4
+Markdown==3.11.3
+# PDF page numbering for build_review.py --pdf.
+PyMuPDF==2.1
