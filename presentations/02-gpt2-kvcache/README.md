@@ -3,7 +3,7 @@
 讲解 `src/learn_gpt2/gpt2.py` 的推理过程，重点说明 KV Cache 为什么能加速。
 
 - `gpt2_kvcache.pptx`：16 页幻灯片，演讲者备注即旁白稿
-- `gpt2_kvcache.mp4`：12:38 讲解视频（3840×2160、60fps，中文配音，烧录字幕）
+- `gpt2_kvcache.mp4`：13:07 讲解视频（3840×2160、60fps，中文配音，烧录字幕）
 - `gpt2_kvcache.srt`：视频字幕
 - `narration.md`：旁白稿
 
@@ -30,6 +30,6 @@
 
 - 分辨率：3840×2160
 - 帧率：60fps
-- 时长：12:38
+- 时长：13:07
 - 配音：edge-tts `zh-CN-YunxiNeural`
 - 字幕：烧录中文字幕，另附 `gpt2_kvcache.srt`
