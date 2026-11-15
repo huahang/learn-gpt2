@@ -401,12 +401,15 @@ def multi_head(board: Board) -> None:
     ]
     for index, (title, body) in enumerate(steps):
         left = 88 + index * 450
-        board.rect(left, 200, 400, 160, CARD, radius=16, line="2E2358")
-        board.text(f"0{index + 1}", left + 24, 218, 340, lh(13), 13, PURPLE, bold=True)
-        board.text(title, left + 24, 250, 350, lh(20), 20, WHITE, bold=True)
-        board.text(body, left + 24, 250 + lh(20) + 6, 350, lh(15), 15, MUTED)
+        board.rect(left, 200, 400, 188, CARD, radius=16, line="2E2358")
+        y = 216
+        board.text(f"0{index + 1}", left + 24, y, 340, lh(13), 13, PURPLE, bold=True)
+        y += lh(13) + 8
+        board.text(title, left + 24, y, 350, lh(20), 20, WHITE, bold=True)
+        y += lh(20) + 6
+        board.text(body, left + 24, y, 350, lh(15), 15, MUTED)
         if index < 3:
-            board.text("→", left + 400, 250, 50, lh(20), 20, PURPLE, align="center")
+            board.text("→", left + 408, 268, 34, lh(20), 20, PURPLE, align="center")
     found = boxes(2, 410, 460, 2)
     board.card(
         *found[0],
@@ -678,16 +681,20 @@ def code_shapes(board: Board) -> None:
         ("乘 V", "(B, nh, T, hs)", "加权求和"),
         ("c_proj", "(B, T, C)", "把头混合回来"),
     ]
+    card_w, card_h, gap_x, gap_y = 560, 252, 32, 20
     for index, (name, shape, note) in enumerate(steps):
-        col = index % 3
-        row = index // 3
-        left = 88 + col * 590
-        top = 190 + row * 250
-        board.rect(left, top, 560, 220, CARD, radius=16, line="2E2358")
-        board.text(f"{index + 1:02d}", left + 24, top + 20, 500, lh(13), 13, PURPLE, bold=True)
-        board.text(name, left + 24, top + 52, 510, lh(22), 22, WHITE, bold=True)
-        board.text(shape, left + 24, top + 52 + lh(22) + 6, 510, lh(16), 16, LAVENDER, mono=True)
-        board.text(note, left + 24, top + 150, 510, lh(14), 14, MUTED)
+        col, row = index % 3, index // 3
+        left = 88 + col * (card_w + gap_x)
+        top = 176 + row * (card_h + gap_y)
+        board.rect(left, top, card_w, card_h, CARD, radius=16, line="2E2358")
+        y = top + 18
+        board.text(f"{index + 1:02d}", left + 24, y, card_w - 48, lh(13), 13, PURPLE, bold=True)
+        y += lh(13) + 6
+        board.text(name, left + 24, y, card_w - 48, lh(22), 22, WHITE, bold=True)
+        y += lh(22) + 8
+        board.text(shape, left + 24, y, card_w - 48, lh(16), 16, LAVENDER, mono=True)
+        y += lh(16) + 10
+        board.text(note, left + 24, y, card_w - 48, lh(15), 15, MUTED)
     board.source(
         "src/learn_gpt2/gpt2.py，CausalSelfAttention，第 92–122 行。L 是缓存里的总长度，没有缓存时 L = T。"
     )
@@ -726,10 +733,14 @@ def three_branches(board: Board) -> None:
     for box, (title, kicker, body, see, rows, cols) in zip(found, specs, strict=True):
         x, y, w, h = box
         board.rect(x, y, w, h, CARD, radius=16, line="2E2358")
-        board.text(kicker, x + 20, y + 16, w - 40, lh(12), 12, PURPLE, bold=True)
-        board.text(title, x + 20, y + 44, w - 40, lh(20), 20, WHITE, bold=True)
-        board.text(body, x + 20, y + 44 + lh(20) + 6, w - 40, lh(14, 2), 14, MUTED)
-        mini_mask(board, x + 24, y + 230, rows, cols, see)
+        text_y = y + 18
+        board.text(kicker, x + 20, text_y, w - 40, lh(12), 12, PURPLE, bold=True)
+        text_y += lh(12) + 8
+        board.text(title, x + 20, text_y, w - 40, lh(20), 20, WHITE, bold=True)
+        text_y += lh(20) + 8
+        board.text(body, x + 20, text_y, w - 40, lh(14, 2), 14, MUTED)
+        text_y += lh(14, 2) + 18
+        mini_mask(board, x + 24, text_y, rows, cols, see)
     board.text(
         "右图是 T=2、L=5：两个新 Query 坐在绝对位置 3 和 4，只能看到自己和更早的 Key。is_causal 会错把掩码安在左上角。",
         88,
@@ -805,9 +816,12 @@ def cache_steps(board: Board) -> None:
     for index, (num, title, body) in enumerate(stages):
         left = 88 + index * 590
         board.rect(left, 190, 560, 280, CARD, radius=16, line="2E2358")
-        board.text(num, left + 24, 210, 80, lh(20), 20, PURPLE, bold=True)
-        board.text(title, left + 24, 260, 510, lh(22), 22, WHITE, bold=True)
-        board.text(body, left + 24, 260 + lh(22) + 8, 510, lh(16, 2), 16, MUTED)
+        y = 208
+        board.text(num, left + 24, y, 80, lh(18), 18, PURPLE, bold=True)
+        y += lh(18) + 8
+        board.text(title, left + 24, y, 510, lh(22), 22, WHITE, bold=True)
+        y += lh(22) + 8
+        board.text(body, left + 24, y, 510, lh(16, 2), 16, MUTED)
     board.rect(88, 500, 1744, 280, CARD, radius=16, line="2E2358")
     board.text("和“五个词重算、取最后一行”相比", 116, 524, 1600, lh(16), 16, PURPLE, bold=True)
     board.text("5.6×10⁻¹⁷", 116, 580, 700, lh(36), 36, WHITE, bold=True)
