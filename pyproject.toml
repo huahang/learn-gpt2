@@ -18,16 +18,42 @@ dependencies = [
     "tiktoken>=0.14.0",
     "wandb>=0.31.0",
     "tqdm>=4.70.1",
+    "safetensors>=0.8.0",
 ]
 
 # Pick exactly one PyTorch backend:
 #   uv sync --extra cuda   # NVIDIA GPU (Linux / Windows)
 #   uv sync --extra rocm   # AMD GPU, e.g. Strix Halo (Linux)
 #   uv sync --extra mps    # Apple Silicon (macOS)
+#
+# Kernel DSLs per backend:
+#   Triton (`import triton`):
+#     cuda: `triton` from PyPI. It ships Linux wheels only.
+#     rocm: `triton-rocm` from the PyTorch ROCm index. It installs the same
+#           `triton/` directory, so never install it together with `triton`.
+#     mps:  not available. Triton has no macOS wheel and no Metal backend.
+#   CuTe DSL (`import cutlass`): cuda only. The `cu13` extra matches the
+#     CUDA 13 build of torch.
+#   TileLang (`import tilelang`): all three backends. It depends on torch, so
+#     it lives in the extras and not in the base dependencies.
+#     cuda: needs a host `nvcc`. Without one, use `tilelang[nvcc]` instead.
+#     rocm: needs a host ROCm installation that provides `hipcc`.
 [project.optional-dependencies]
-cuda = ["torch>=2.11"]
-rocm = ["torch>=2.11", "triton-rocm"]
-mps = ["torch>=2.11"]
+cuda = [
+    "nvidia-cutlass-dsl[cu13]>=4.8.1",
+    "tilelang>=0.1.15",
+    "torch>=2.11",
+    "triton>=3.9.0; sys_platform == 'linux'",
+]
+rocm = [
+    "tilelang>=0.1.15",
+    "torch>=2.11",
+    "triton-rocm",
+]
+mps = [
+    "tilelang>=0.1.15",
+    "torch>=2.11",
+]
 
 [project.scripts]
 learn-gpt2 = "learn_gpt2:main"
