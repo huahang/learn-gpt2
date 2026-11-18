@@ -64,6 +64,7 @@ NVIDIA GPU 或 Apple Silicon 环境分别将 `rocm` 替换为 `cuda` 或 `mps`. 
 .
 ├── src/learn_gpt2/
 │   └── __init__.py    # main() 命令行入口
+├── cpp/               # C++ 推理框架, 加载 cubin kernel, 见 cpp/README.md
 ├── gpt2_hf.ipynb      # GPT-2 实验笔记本
 ├── pyproject.toml     # 依赖, 后端与构建配置
 ├── uv.lock            # 依赖锁文件
@@ -245,3 +246,33 @@ uv run --extra cuda pytest tests/test_gpt2_inference_cute_dsl.py
 ```
 
 测试使用随机初始化的小模型, 不下载权重. 没有 NVIDIA GPU 或没有安装 CuTe DSL 时, 测试自动跳过.
+
+## C++ 推理框架
+
+`cpp/` 用 C++ 实现 GPT-2 的 FP16 推理: 从 safetensors 文件加载权重, 加载预先编译的 cubin kernel
+计算. kernel 有 TileLang 与 CuTe DSL 两个版本, 分别由 `cpp/kernels/build_tilelang.py` 与
+`cpp/kernels/build_cute_dsl.py` 编译得到. 两个版本的 cubin 接口相同 (入口符号, 参数和启动配置),
+运行时用 `--backend` 选择. 运行时只依赖 CUDA 驱动和仓库中的
+[safetensors-cpp](cpp/third_party/safetensors-cpp/), 不需要 Python 或 PyTorch.
+
+构建需要 `cuda` 后端依赖, `nvcc` 与支持 C++20 的编译器 (例如 GCC 13 或 Clang 17 及更新的版本):
+
+```bash
+uv sync --extra cuda
+cpp/build.sh            # 或 make -C cpp
+MODEL=$(ls -d ~/.cache/huggingface/hub/models--gpt2/snapshots/*/)
+cpp/build/bin/gpt2 --model "$MODEL" --backend cute_dsl --prompt "Hello, I am a language model,"
+```
+
+`--model` 也可以是单个 safetensors 文件; 检查点目录中的 `vocab.json` 与 `merges.txt` 用于分词.
+程序实现了 GPT-2 的字节级 BPE 分词, 贪心解码与 temperature / top-k 采样.
+
+验证命令:
+
+```bash
+make -C cpp check
+```
+
+它用 `cuobjdump` 检查两组 cubin 的接口, 再运行 `tests/test_cpp_kernels.py` (逐个 kernel 与
+PyTorch 比较) 与 `tests/test_cpp_inference.py` (随机小模型的端到端测试).
+接口定义, 构建选项与实现细节见 [cpp/README.md](cpp/README.md).

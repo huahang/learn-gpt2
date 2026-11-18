@@ -5,11 +5,12 @@
 本仓库用于学习 GPT-2, 使用 Python / Transformers / PyTorch. 当前代码仍处于初始阶段.
 
 - `src/learn_gpt2/`: Python 包. `__init__.py` 中的 `main()` 是命令行入口, 调用 `pipeline.py` 中的交互式文本生成循环. `gpt2.py` 是自行实现的 GPT-2, 含推理用的 `KVCache` 与 `GPT2.generate()`. `gpt2_inference_triton.py` 用 Triton 语言实现 GPT-2 的 FP16 推理算子, 从 safetensors 加载权重, 含 `GPT2Inference.from_safetensors()` 与 `generate()`; 它需要 NVIDIA GPU, 没有 GPU 或 Triton 时 `tests/test_gpt2_inference_triton.py` 自动跳过. `gpt2_inference_cute_dsl.py` 用 CuTe DSL (`import cutlass`) 实现同样的 FP16 推理, 接口相同 (`GPT2Inference`), 需要 SM80 或更新的 NVIDIA GPU; 没有 GPU 或 CuTe DSL 时 `tests/test_gpt2_inference_cute_dsl.py` 自动跳过. `qwen3.5_0.8b.py` 是自行实现的 Qwen3.5-0.8B 文本模型 (Gated DeltaNet 与全注意力混合), 结构与参数名同 HF `Qwen3_5ForCausalLM` 一致, 含 `HybridCache` 与 `Qwen3_5.from_pretrained()`; 文件名含点号, 需用 `importlib.util.spec_from_file_location` 加载 (见 `tests/test_qwen3_5.py`).
+- `cpp/`: C++ 推理框架. 从 safetensors 加载 GPT-2 权重, 加载 cubin kernel 推理. `cpp/kernels/kernel_abi.py` 定义 kernel 接口; `build_tilelang.py` 与 `build_cute_dsl.py` 分别用 TileLang 和 CuTe DSL 编写同一组 kernel 并导出为 cubin, 两组 cubin 可以互换. `cpp/src/` 是 C++ 程序, 只依赖 CUDA driver API 与 `cpp/third_party/safetensors-cpp/` (上游代码, 不要修改, 来源见其中的 `VENDOR.md`). 构建输出在 `cpp/build/`. 用法见 `cpp/README.md`.
 - `presentations/`: 讲解材料 (PPT, 视频及其生成脚本). 其中 `*.mp4` 与 `*.pptx` 由 Git LFS 管理 (见 `.gitattributes`), 克隆后需 `git lfs install` 再 `git lfs pull`.
 - `gpt2_hf.ipynb` / `qwen3.5_0.8b.ipynb`: 根目录中的实验笔记本. 将可复用逻辑放入包中, 让笔记本专注于实验与展示.
 - `pyproject.toml`: 项目元数据, 依赖, 构建配置与硬件后端配置.
 - `uv.lock`: 依赖锁文件. 修改依赖时同步更新.
-- `README.md`: 当前为空, 新增使用流程时补充说明.
+- `README.md`: 项目简介与使用流程. 新增使用流程时补充说明.
 
 - `tests/`: pytest 测试, 使用随机初始化的小模型, 不需要下载权重.
 
@@ -26,6 +27,8 @@
 - `uv run learn-gpt2`: 运行已配置的命令行入口.
 - `uv run pytest`: 运行 `tests/` 中的测试. 测试依赖 PyTorch, 需先安装一个硬件后端, 或直接使用 `uv run --extra cuda pytest` (按硬件换成 `rocm` / `mps`).
 - `uv run jupyter lab`: 启动本地笔记本开发环境.
+- `cpp/build.sh` 或 `make -C cpp`: 构建两组 cubin 与 C++ 程序 `cpp/build/bin/gpt2`. 需要 `cuda` 后端依赖, `nvcc` 与支持 C++20 的编译器 (GCC 13 或 Clang 17 及更新的版本).
+- `make -C cpp check`: 用 `cuobjdump` 检查 cubin 接口, 再运行 `tests/test_cpp_*.py`. 没有构建产物时这两个测试文件自动跳过.
 - `uv build`: 使用 `uv_build` 构建源码包与 wheel.
 - `uv run ruff check`: 对 `.py` 与 `.ipynb` 运行 lint; 加 `--fix` 自动修复可修复的问题.
 - `uv run ruff format`: 格式化 `.py` 与 `.ipynb`; 加 `--check` 仅检查不修改.
@@ -48,7 +51,7 @@ Python 使用 4 个空格缩进, 保持现有双引号风格. 函数和变量使
 
 ## 测试与验证
 
-测试框架为 pytest (在 `dev` 依赖组中), 当前没有覆盖率门槛. 修改 `gpt2.py` 后运行 `uv run pytest`; 修改入口后运行 `uv run learn-gpt2`; 修改打包配置后运行 `uv build`. 修改笔记本后重启内核, 按顺序执行相关单元并检查结果. 新增测试使用 `tests/test_*.py` 命名.
+测试框架为 pytest (在 `dev` 依赖组中), 当前没有覆盖率门槛. 修改 `gpt2.py` 后运行 `uv run pytest`; 修改入口后运行 `uv run learn-gpt2`; 修改 `cpp/` 或 `gpt2_inference_cute_dsl.py` 中被 `cpp/kernels/` 引用的函数后运行 `make -C cpp check`; 修改打包配置后运行 `uv build`. 修改笔记本后重启内核, 按顺序执行相关单元并检查结果. 新增测试使用 `tests/test_*.py` 命名.
 
 ## 提交与 Pull Request
 
