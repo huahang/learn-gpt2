@@ -9,15 +9,18 @@
 * 加载时转置矩阵，使 GEMM 按连续的 K 维读取权重；LM head 共享词嵌入。
 * FP16 输入配合 FP32 累加；LayerNorm 和在线 softmax 的归约也使用 FP32。
 * QKV 合并为一个 GEMM，直接写入按 head 排列的 KV 缓存，不再转置或复制。
-* FlashAttention 用两个 GEMM 计算 QK^T 和 PV，不保存完整的注意力矩阵。
-* 解码时沿 KV 长度拆分任务，再合并在线 softmax 的结果，提高小 batch 的并行度。
-* GEMM 使用共享内存、软件流水线和 L2 swizzle；预填充和解码使用不同的块大小。
+* FlashAttention 用两个 GEMM 计算 QK^T 和 PV，不保存完整的注意力矩阵。K/V 用异步复制并分两级
+  流水；P 留在寄存器中，直接作为第二个 GEMM 的输入；因果掩码写入分数的初值。
+* 解码时按实际长度把 key 块分给多个 split，再合并在线 softmax 的结果，提高小 batch 的并行度。
+* GEMM 使用共享内存、软件流水线和 L2 swizzle。块大小按矩阵形状和 SM 数选择，
+  预填充最大用 128 x 128 的块和 8 个 warp。
 * 在 GEMM 的后处理中融合 bias、GELU 或 residual；融合两种嵌入的读取和相加。
 * 预分配工作区和输出序列；生成时只计算最后一个位置的 logits。
+* SM90 及以上用程序化依赖启动 (PDL)，下一个内核在本内核运行时完成启动。
 * 将缓存位置放在 GPU 上，捕获并复用固定形状的单步解码 CUDA Graph。
 
-这些是结构优化，块大小是启发式值。实际速度需要在目标 GPU 上测量。
-工作区由实例复用，同一实例不能并发处理多个请求。
+LayerNorm 单独运行，保持与 ``gpt2.py`` 相同的 FP16 舍入点。块大小在 RTX PRO 4000 Blackwell
+上测得；其他 GPU 需要重新测量。工作区由实例复用，同一实例不能并发处理多个请求。
 """
 
 import argparse
@@ -52,9 +55,22 @@ def _power_of_two(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+@T.macro
+def _wait_for_previous_kernel() -> None:
+    """程序化依赖启动 (PDL)：等前一个内核完成并写回结果，再允许下一个内核提前启动。
+
+    下一个内核因此能在本内核运行时完成启动和 CTA 调度，只在读取数据前等待。
+    PDL 需要 SM90 或更新的 GPU；内核工厂的 ``pdl`` 参数控制是否插入这一步。
+    """
+    T.evaluate(T.pdl_sync())
+    T.evaluate(T.pdl_trigger())
+
+
 # 返回 PrimFunc 而不在定义时编译，便于在无 GPU 的环境中检查生成的 IR。
 # 每种形状只编译一次；所有输出都由调用者预分配。
-def _embedding_kernel(batch: int, length: int, channels: int, vocab: int, context: int) -> Any:
+def _embedding_kernel(
+    batch: int, length: int, channels: int, vocab: int, context: int, pdl: bool = False
+) -> Any:
     @T.prim_func
     def main(
         ids: T.Tensor((batch * length,), "int64"),
@@ -64,6 +80,8 @@ def _embedding_kernel(batch: int, length: int, channels: int, vocab: int, contex
         output: T.Tensor((batch * length, channels), "float16"),
     ):
         with T.Kernel(batch * length, threads=128) as row:
+            if pdl:
+                _wait_for_previous_kernel()
             for c in T.Parallel(channels):
                 output[row, c] = T.cast(wte[ids[row], c], "float32") + T.cast(
                     wpe[position[0] + row % length, c], "float32"
@@ -72,7 +90,9 @@ def _embedding_kernel(batch: int, length: int, channels: int, vocab: int, contex
     return main
 
 
-def _layernorm_kernel(batch: int, length: int, channels: int, last_only: bool) -> Any:
+def _layernorm_kernel(
+    batch: int, length: int, channels: int, last_only: bool, pdl: bool = False
+) -> Any:
     rows = batch if last_only else batch * length
     block = _power_of_two(channels)
 
@@ -84,6 +104,8 @@ def _layernorm_kernel(batch: int, length: int, channels: int, last_only: bool) -
         output: T.Tensor((rows, channels), "float16"),
     ):
         with T.Kernel(rows, threads=128) as row:
+            if pdl:
+                _wait_for_previous_kernel()
             values = T.alloc_fragment((block,), "float32")
             centered = T.alloc_fragment((block,), "float32")
             squares = T.alloc_fragment((block,), "float32")
@@ -97,17 +119,49 @@ def _layernorm_kernel(batch: int, length: int, channels: int, last_only: bool) -
                 centered[c] = T.if_then_else(c < channels, values[c] - total[0] / channels, 0)
                 squares[c] = centered[c] * centered[c]
             T.reduce_sum(squares, variance, dim=0)
-            for c in T.Parallel(channels):
-                output[row, c] = centered[c] * T.rsqrt(
-                    variance[0] / channels + LAYER_NORM_EPS
-                ) * T.cast(gain[c], "float32") + T.cast(bias[c], "float32")
+            # 与 centered 的形状一致，再跳过补齐的通道。
+            for c in T.Parallel(block):
+                if c < channels:
+                    output[row, c] = centered[c] * T.rsqrt(
+                        variance[0] / channels + LAYER_NORM_EPS
+                    ) * T.cast(gain[c], "float32") + T.cast(bias[c], "float32")
 
     return main
 
 
-def _gemm_tiling(rows: int) -> tuple[int, int, int, int]:
-    # 小 M 减少补零计算；大 M 提高每次权重读取的复用率。
-    return (16, 64, 64, 2) if rows <= 16 else (64, 64, 32, 3)
+# 块大小在 RTX PRO 4000 Blackwell (SM120，70 个 SM) 上用 GPT-2 small 测得。
+# 元素为 (bm, bn, bk, stages, threads)。
+# 解码时一个 16 行的块容纳整个 batch，每个权重只读一次，速度受显存带宽限制。
+# N 较小时用窄块，使 CTA 数至少达到 SM 数的一半。
+_DECODE_TILES = ((16, 64, 64, 4, 128), (16, 32, 128, 4, 64))
+# 预填充受算力限制。块越大，每次读取的数据参与的乘加越多，但块数要足够填满 SM。
+# 候选块从大到小排列；128 x 256 只在块数很多时使用。
+_PROMPT_TILES = (
+    (128, 128, 64, 3, 256),
+    (64, 128, 64, 3, 256),
+    (128, 64, 64, 3, 128),
+    (64, 64, 64, 4, 128),
+    (32, 64, 64, 4, 128),
+    (16, 64, 64, 4, 128),
+)
+_WIDE_PROMPT_TILE = (128, 256, 32, 3, 256)
+# 离线编译检查没有 GPU，使用这个 SM 数选择块大小。
+_DEFAULT_SM_COUNT = 64
+
+
+def _gemm_tiling(rows: int, n: int, sm_count: int) -> tuple[int, int, int, int, int]:
+    if rows <= 16:
+        wide, narrow = _DECODE_TILES
+        return wide if n // wide[1] >= sm_count // 2 else narrow
+    if _ceildiv(rows, 128) * _ceildiv(n, 256) >= 4 * sm_count:
+        return _WIDE_PROMPT_TILE
+    fitting = [tile for tile in _PROMPT_TILES if tile[0] <= _power_of_two(rows)]
+    for tile in fitting:
+        ctas = _ceildiv(rows, tile[0]) * _ceildiv(n, tile[1])
+        # 选择能让一半 SM 分到 CTA 的最大块。需要 1 到 2 波的块不选：第二波只占用少数 SM。
+        if ctas >= sm_count / 2 and not sm_count < ctas < 2 * sm_count:
+            return tile
+    return fitting[-1]
 
 
 def _linear_kernel(
@@ -119,8 +173,10 @@ def _linear_kernel(
     gelu: bool = False,
     residual: bool = False,
     logits: bool = False,
+    sm_count: int = _DEFAULT_SM_COUNT,
+    pdl: bool = False,
 ) -> Any:
-    bm, bn, bk, stages = _gemm_tiling(rows)
+    bm, bn, bk, stages, threads = _gemm_tiling(rows, n, sm_count)
     output_dtype = "float32" if logits else "float16"
 
     @T.prim_func
@@ -130,7 +186,9 @@ def _linear_kernel(
         bias: T.Tensor((n,), "float16"),
         output: T.Tensor((rows, n), output_dtype),
     ):
-        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(rows, bm), threads=128) as (col, row):
+        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(rows, bm), threads=threads) as (col, row):
+            if pdl:
+                _wait_for_previous_kernel()
             a = T.alloc_shared((bm, bk), "float16")
             b = T.alloc_shared((bn, bk), "float16")
             acc = T.alloc_fragment((bm, bn), "float32")
@@ -164,11 +222,18 @@ def _linear_kernel(
     return main
 
 
-def _qkv_kernel(config: GPT2Config, batch: int, length: int, capacity: int) -> Any:
+def _qkv_kernel(
+    config: GPT2Config,
+    batch: int,
+    length: int,
+    capacity: int,
+    sm_count: int = _DEFAULT_SM_COUNT,
+    pdl: bool = False,
+) -> Any:
     c, heads = config.n_embd, config.n_head
     dim, slots = c // heads, 1 + 2 * config.n_layer
     rows = batch * length
-    bm, bn, bk, stages = _gemm_tiling(rows)
+    bm, bn, bk, stages, threads = _gemm_tiling(rows, 3 * c, sm_count)
 
     @T.prim_func
     def main(
@@ -179,7 +244,12 @@ def _qkv_kernel(config: GPT2Config, batch: int, length: int, capacity: int) -> A
         position: T.Tensor((1,), "int32"),
         kv_slot: T.int32,
     ):
-        with T.Kernel(T.ceildiv(3 * c, bn), T.ceildiv(rows, bm), threads=128) as (col, row):
+        with T.Kernel(T.ceildiv(3 * c, bn), T.ceildiv(rows, bm), threads=threads) as (
+            col,
+            row,
+        ):
+            if pdl:
+                _wait_for_previous_kernel()
             a = T.alloc_shared((bm, bk), "float16")
             b = T.alloc_shared((bn, bk), "float16")
             acc = T.alloc_fragment((bm, bn), "float32")
@@ -201,15 +271,29 @@ def _qkv_kernel(config: GPT2Config, batch: int, length: int, capacity: int) -> A
     return main
 
 
+def _attention_tiling(length: int) -> tuple[int, int, int, int]:
+    """返回注意力的 (bm, bn, threads, stages)。
+
+    每个 warp 负责 16 个完整的 query 行，P 才能留在寄存器中作为第二个 GEMM 的输入。
+    解码只有一个 query，所以只用一个 warp。长提示词用 128 行的块，每次读取的 K/V
+    供更多 query 使用；短提示词用 64 行的块，块数更多。
+    """
+    if length == 1:
+        return (16, 64, 32, 2)
+    return (128, 128, 256, 2) if length >= 256 else (64, 64, 128, 2)
+
+
 def _attention_kernel(
-    config: GPT2Config, batch: int, length: int, capacity: int, splits: int
+    config: GPT2Config, batch: int, length: int, capacity: int, splits: int, pdl: bool = False
 ) -> Any:
     heads, dim = config.n_head, config.n_embd // config.n_head
     slots, bd = 1 + 2 * config.n_layer, max(16, _power_of_two(dim))
-    bm, bn = (16, 64) if length == 1 else (32, 64)
+    bm, bn, threads, stages = _attention_tiling(length)
+    if dim != bd:
+        # 补齐的 head 维度用逐元素加载，不能与计算流水重叠。
+        stages = 1
     split_kv = length == 1 and splits > 1
     partitions = splits if split_kv else 1
-    partition_size = _ceildiv(capacity, partitions * bn) * bn
     # Query 权重已乘入 1/sqrt(dim)，这里仅转换为 exp2 的底数。
     log2e = math.log2(math.e)
 
@@ -222,17 +306,19 @@ def _attention_kernel(
         lse: T.Tensor((batch, heads, splits), "float32"),
         kv_slot: T.int32,
     ):
-        with T.Kernel(T.ceildiv(length, bm), batch * heads, partitions, threads=128) as (
+        with T.Kernel(T.ceildiv(length, bm), batch * heads, partitions, threads=threads) as (
             query_tile,
             batch_head,
             partition,
         ):
+            if pdl:
+                _wait_for_previous_kernel()
             q = T.alloc_shared((bm, bd), "float16")
             k = T.alloc_shared((bn, bd), "float16")
             v = T.alloc_shared((bn, bd), "float16")
-            # 共享内存同时转换两次 GEMM 的 fragment 布局，也支持补齐后的 head_size。
-            probability = T.alloc_shared((bm, bn), "float16")
             scores = T.alloc_fragment((bm, bn), "float32")
+            # P 留在寄存器中，直接作为第二个 GEMM 的 A 操作数。
+            probability = T.alloc_fragment((bm, bn), "float16")
             acc = T.alloc_fragment((bm, bd), "float32")
             maximum = T.alloc_fragment((bm,), "float32")
             previous = T.alloc_fragment((bm,), "float32")
@@ -241,51 +327,48 @@ def _attention_kernel(
             tile_sum = T.alloc_fragment((bm,), "float32")
             b, h = batch_head // heads, batch_head % heads
             total = position[0] + length
-            begin = partition * partition_size
-            end = T.min(
-                T.min(total, (partition + 1) * partition_size),
-                position[0] + (query_tile + 1) * bm,
-            )
-            for i, d in T.Parallel(bm, bd):
-                q[i, d] = T.if_then_else(
-                    query_tile * bm + i < length and d < dim,
-                    arena[0, b, h, position[0] + query_tile * bm + i, d],
-                    0,
-                )
+            first = position[0] + query_tile * bm
+            # 按实际长度把 key 块均分给各个 split，短前缀也能用上所有 split。
+            per_split = T.ceildiv(T.ceildiv(total, bn), partitions) * bn
+            begin = partition * per_split
+            end = T.min(T.min(total, begin + per_split), first + bm)
+            # 越界的行和补齐的 head 维度填零。缓存初始化为零，
+            # 所以已分配但尚未写入的位置也是有限值，掩码后不会产生 NaN。
+            if dim == bd:
+                T.copy(arena[0, b, h, first, 0], q)
+            else:
+                for i, d in T.Parallel(bm, bd):
+                    q[i, d] = T.if_then_else(
+                        first + i < capacity and d < dim, arena[0, b, h, first + i, d], 0
+                    )
             T.clear(acc)
             T.clear(denominator)
             # 有限初值使空的 split 不产生 -inf - -inf。
             T.fill(maximum, -1e30)
-            for tile in T.Pipelined(T.max(T.ceildiv(end - begin, bn), 0), num_stages=1):
-                for j, d in T.Parallel(bn, bd):
-                    key = begin + tile * bn + j
-                    k[j, d] = T.if_then_else(
-                        key < total and d < dim, arena[kv_slot, b, h, key, d], 0
-                    )
-                    v[j, d] = T.if_then_else(
-                        key < total and d < dim, arena[kv_slot + 1, b, h, key, d], 0
-                    )
-                T.clear(scores)
-                T.gemm(q, k, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+            for tile in T.Pipelined(T.max(T.ceildiv(end - begin, bn), 0), num_stages=stages):
+                key = begin + tile * bn
+                if dim == bd:
+                    # head_size 是 2 的幂时用异步复制，由流水线与计算重叠。
+                    T.copy(arena[kv_slot, b, h, key, 0], k)
+                    T.copy(arena[kv_slot + 1, b, h, key, 0], v)
+                else:
+                    for j, d in T.Parallel(bn, bd):
+                        inside = key + j < capacity and d < dim
+                        k[j, d] = T.if_then_else(inside, arena[kv_slot, b, h, key + j, d], 0)
+                        v[j, d] = T.if_then_else(inside, arena[kv_slot + 1, b, h, key + j, d], 0)
+                # 掩码写入初值，GEMM 在其上累加：被遮住的分数仍为 -1e30。
+                # 无效 query 行沿用最后一个真实 query 的掩码，避免全掩码行。
                 for i, j in T.Parallel(bm, bn):
-                    key = begin + tile * bn + j
-                    # 无效 query 行沿用最后一个真实 query 的掩码，避免全掩码行。
                     visible = position[0] + T.min(query_tile * bm + i, length - 1)
-                    scores[i, j] = T.if_then_else(
-                        key < total and key <= visible, scores[i, j], -1e30
-                    )
+                    scores[i, j] = T.if_then_else(key + j <= visible, 0, -1e30)
+                T.gemm(q, k, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 T.copy(maximum, previous)
                 T.reduce_max(scores, maximum, dim=1, clear=False)
                 for i in T.Parallel(bm):
                     rescale[i] = T.exp2((previous[i] - maximum[i]) * log2e)
+                # 每行在第一个块中至少有一个可见 key，此后被遮住的分数换算后为 0。
                 for i, j in T.Parallel(bm, bn):
-                    key = begin + tile * bn + j
-                    visible = position[0] + T.min(query_tile * bm + i, length - 1)
-                    scores[i, j] = T.if_then_else(
-                        key < total and key <= visible,
-                        T.exp2((scores[i, j] - maximum[i]) * log2e),
-                        0,
-                    )
+                    scores[i, j] = T.exp2((scores[i, j] - maximum[i]) * log2e)
                 T.reduce_sum(scores, tile_sum, dim=1)
                 for i in T.Parallel(bm):
                     denominator[i] = denominator[i] * rescale[i] + tile_sum[i]
@@ -306,8 +389,9 @@ def _attention_kernel(
                             -T.infinity("float32"),
                         )
             else:
-                for i, d in T.Parallel(bm, dim):
-                    if query_tile * bm + i < length:
+                # 循环必须覆盖整个 fragment：只遍历前 dim 列会让布局推断给出错误的线程映射。
+                for i, d in T.Parallel(bm, bd):
+                    if query_tile * bm + i < length and d < dim:
                         output[b * length + query_tile * bm + i, h * dim + d] = (
                             acc[i, d] / denominator[i]
                         )
@@ -315,7 +399,9 @@ def _attention_kernel(
     return main
 
 
-def _merge_attention_kernel(batch: int, heads: int, dim: int, splits: int) -> Any:
+def _merge_attention_kernel(
+    batch: int, heads: int, dim: int, splits: int, pdl: bool = False
+) -> Any:
     bd = max(16, _power_of_two(dim))
 
     @T.prim_func
@@ -325,6 +411,8 @@ def _merge_attention_kernel(batch: int, heads: int, dim: int, splits: int) -> An
         output: T.Tensor((batch, heads * dim), "float16"),
     ):
         with T.Kernel(batch, heads, threads=128) as (b, h):
+            if pdl:
+                _wait_for_previous_kernel()
             logs = T.alloc_fragment((splits,), "float32")
             weights = T.alloc_fragment((splits,), "float32")
             values = T.alloc_fragment((splits, bd), "float32")
@@ -340,8 +428,9 @@ def _merge_attention_kernel(batch: int, heads: int, dim: int, splits: int) -> An
             for s, d in T.Parallel(splits, bd):
                 values[s, d] = weights[s] * partial[b, h, s, d]
             T.reduce_sum(values, result, dim=0)
-            for d in T.Parallel(dim):
-                output[b, h * dim + d] = result[d] / total[0]
+            for d in T.Parallel(bd):
+                if d < dim:
+                    output[b, h * dim + d] = result[d] / total[0]
 
     return main
 
@@ -471,19 +560,30 @@ class _LayerWeights:
 
 
 class _Workspace:
-    def __init__(self, config: GPT2Config, batch: int, capacity: int, device: torch.device):
+    def __init__(
+        self,
+        config: GPT2Config,
+        batch: int,
+        capacity: int,
+        device: torch.device,
+        sm_count: int = _DEFAULT_SM_COUNT,
+    ):
         c, dim = config.n_embd, config.n_embd // config.n_head
         rows = batch * capacity
         self.batch = batch
         self.capacity = capacity
-        self.splits = min(8, _power_of_two(_ceildiv(capacity, 128)))
+        # 解码时每个 (序列, head) 拆成若干 split，使每个 SM 约有一个 CTA。
+        # 拆得更细时每个 split 只有一两个 key 块，固定开销反而更多。
+        key_blocks = _ceildiv(capacity, _attention_tiling(1)[1])
+        self.splits = max(1, min(key_blocks, _ceildiv(sm_count, batch * config.n_head)))
         self.position = torch.zeros(1, dtype=torch.int32, device=device)
         self.tokens = torch.empty(batch, dtype=torch.int64, device=device)
         self.x = torch.empty(rows, c, dtype=torch.float16, device=device)
         self.norm = torch.empty_like(self.x)
         self.attention = torch.empty_like(self.x)
         self.hidden = torch.empty(rows, 4 * c, dtype=torch.float16, device=device)
-        self.arena = torch.empty(
+        # 注意力按整块读取缓存，未写入的位置必须是有限值，所以用零初始化。
+        self.arena = torch.zeros(
             1 + 2 * config.n_layer,
             batch,
             config.n_head,
@@ -540,6 +640,9 @@ class GPT2Inference:
         # Hopper 及后续架构的专用指令需要带 a 的目标，例如 sm_90a。
         suffix = "a" if major >= 9 else ""
         self.target = json.dumps({"kind": "cuda", "arch": f"sm_{major}{minor}{suffix}"})
+        self.sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        # 程序化依赖启动 (PDL) 需要 SM90 或更新的 GPU。
+        self.pdl = major >= 9
         self.config = config
         self.device = device
         self.dtype = torch.float16
@@ -613,7 +716,7 @@ class GPT2Inference:
             self._ws = None
             ws = None
             capacity = min(self.config.block_size, max(64, _power_of_two(length)))
-            ws = _Workspace(self.config, batch, capacity, self.device)
+            ws = _Workspace(self.config, batch, capacity, self.device, self.sm_count)
             self._ws = ws
         return ws
 
@@ -628,7 +731,13 @@ class GPT2Inference:
         rows = ws.batch if last_only else ws.batch * length
         output = ws.norm[:rows]
         _compile(
-            _layernorm_kernel, ws.batch, length, self.config.n_embd, last_only, target=self.target
+            _layernorm_kernel,
+            ws.batch,
+            length,
+            self.config.n_embd,
+            last_only,
+            pdl=self.pdl,
+            target=self.target,
         )(ws.x[: ws.batch * length], *weights, output)
         return output
 
@@ -653,6 +762,8 @@ class GPT2Inference:
             gelu=gelu,
             residual=residual,
             logits=logits,
+            sm_count=self.sm_count,
+            pdl=self.pdl,
             target=self.target,
         )(x, weight, bias, output)
 
@@ -674,9 +785,19 @@ class GPT2Inference:
             self.config.n_embd,
             self.config.vocab_size,
             self.config.block_size,
+            pdl=self.pdl,
             target=self.target,
         )(tokens, self.wte, self.wpe, ws.position, x)
-        qkv = _compile(_qkv_kernel, self.config, ws.batch, length, ws.capacity, target=self.target)
+        qkv = _compile(
+            _qkv_kernel,
+            self.config,
+            ws.batch,
+            length,
+            ws.capacity,
+            sm_count=self.sm_count,
+            pdl=self.pdl,
+            target=self.target,
+        )
         attend = _compile(
             _attention_kernel,
             self.config,
@@ -684,6 +805,7 @@ class GPT2Inference:
             length,
             ws.capacity,
             ws.splits,
+            pdl=self.pdl,
             target=self.target,
         )
         for i, layer in enumerate(self.layers):
@@ -698,6 +820,7 @@ class GPT2Inference:
                     self.config.n_head,
                     self.config.n_embd // self.config.n_head,
                     ws.splits,
+                    pdl=self.pdl,
                     target=self.target,
                 )(ws.partial, ws.lse, attention)
             self._linear(attention, layer.attn_w, layer.attn_b, x, residual=True)

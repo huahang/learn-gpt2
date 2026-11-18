@@ -175,10 +175,20 @@ output = model.generate(tokens, max_new_tokens=64, temperature=0)
 HF Conv1D 权重默认采用 `(in, out)` 布局；从本仓库 `GPT2.state_dict()` 保存的权重
 必须指定 `weight_layout="pytorch"`（命令行使用 `--weight-layout pytorch`）。
 
-主要优化包括合并 QKV GEMM 并直接写缓存、FlashAttention、split-KV 解码、
-融合 bias/GELU/residual、GEMM 软件流水线和 L2 swizzle、工作区复用、
-仅计算末位 logits，以及 CUDA Graph。超过 GPT-2 的绝对位置范围后，逐步重算最后一个上下文窗口。
-同一个模型实例复用工作区，不能并发处理多个请求。块大小使用启发式配置，性能需在目标 GPU 上测量。
+主要优化：
+
+- GEMM：合并 QKV GEMM 并直接写缓存；融合 bias/GELU/residual；软件流水线和 L2 swizzle。
+  块大小按形状选择：解码时 N 较小的 GEMM 用 16 x 32 的窄块，使 CTA 数达到 SM 数的一半；
+  预填充从 128 x 128（8 个 warp）开始，选择能让一半 SM 分到 CTA、且不需要 1 到 2 波的最大块。
+- 注意力：FlashAttention。K/V 用异步复制并分两级流水；P 留在寄存器中，直接作为第二个 GEMM 的输入；
+  因果掩码写入分数的初值，每块只扫描一遍。长提示词用 128 行的块。解码时按实际长度把 key 块
+  分给各个 split，split 数使每个 SM 约有一个 CTA。
+- PDL（SM90 及以上）：每个内核先等前一个内核完成，再允许下一个内核提前启动。
+- 工作区复用，仅计算末位 logits，CUDA Graph。
+
+超过 GPT-2 的绝对位置范围后，逐步重算最后一个上下文窗口。
+同一个模型实例复用工作区，不能并发处理多个请求。块大小在 RTX PRO 4000 Blackwell 上测得，
+其他 GPU 需重新测量。与其他实现的速度对比见下一节的表格。
 实现参考 [TileLang GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/quickstart.py)
 和 [FlashAttention 示例](https://github.com/tile-ai/tilelang/blob/main/examples/flash_attention/example_mha_fwd_bshd.py)。
 
@@ -216,7 +226,7 @@ print(enc.decode(output[0].tolist()))
 
 主要优化:
 
-- GEMM: 所有矩阵乘都在 Tensor Core 上计算 (`mma.sync` m16n8k16). 这包括每个 block 的 4 个线性层, LM head 和注意力中的两次乘法. `cp.async` 多级流水线把分块从显存搬到共享内存. 共享内存采用 swizzle 布局, 避免 bank 冲突. `ldmatrix` 把操作数读入寄存器, 并与 `mma` 双缓冲. 块大小按矩阵形状选择.
+- GEMM: 所有矩阵乘都在 Tensor Core 上计算 (`mma.sync` m16n8k16). 这包括每个 block 的 4 个线性层, LM head 和注意力中的两次乘法. `cp.async` 多级流水线把分块从显存搬到共享内存. 共享内存采用 swizzle 布局, 避免 bank 冲突. `ldmatrix` 把操作数读入寄存器, 并与 `mma` 双缓冲. 块大小按矩阵形状选择: 预填充从 128 x 128 (8 个 warp) 开始, 选择能让一半 SM 分到 CTA, 且不需要 1 到 2 波的最大块.
 - LayerNorm 折叠: 加载权重时, `ln_1` 与 `ln_2` 的增益和偏移折进下一个 GEMM 的权重和 bias. GEMM 的尾处理用每行的均值和 1/std 完成归一化, 不写出归一化后的激活. decode 步的 GEMM 直接从寄存器中的 A 分片计算行统计量, 不需要额外内核.
 - 尾处理融合: bias, GELU 和残差并入 GEMM 的尾处理. QKV 投影直接写入 KV cache. 累加结果先暂存在共享内存, 再按连续向量写出; 每个元素只舍入一次.
 - 注意力: FlashAttention 式在线 softmax. P 矩阵留在寄存器中, 直接作为下一次 `mma` 的输入. decode 步把 KV 序列分给多个 CTA (split-KV), 再按 log-sum-exp 合并.
@@ -226,14 +236,18 @@ print(enc.decode(output[0].tolist()))
 - PDL (programmatic dependent launch): 后一个 GEMM 在前一个内核结束前预取权重.
 - CUDA Graph: 一个 decode 步只需回放一次图. 内核通过 TVM-FFI 调用, Python 端开销很小.
 
-实测数据 (GPT-2 small, RTX PRO 4000 Blackwell SFF, 三种实现在同一个脚本中依次运行). decode 为每步时间, 提示长 16, 生成 256 个 token. 提示一栏为一次预填充的时间; `gpt2.py` 在这一栏计算全部位置的 logits, 另外两种实现只计算末位 logits.
+实测数据 (GPT-2 small, RTX PRO 4000 Blackwell SFF). 四种实现在同一个脚本中交替运行 4 轮, 每格取最小值. decode 为每步时间; "16 + 256" 表示提示长 16, 生成 256 个 token. 提示一栏为一次预填充的时间; `gpt2.py` 在这一栏计算全部位置的 logits, 另外三种实现只计算末位 logits.
 
-| 场景 | `gpt2.py` FP16 | Triton | CuTe DSL |
-| --- | --- | --- | --- |
-| decode, 1 条序列, 每步 | 1.07 ms | 0.85 ms | 0.81 ms |
-| decode, 8 条序列, 每步 | 1.19 ms | 0.96 ms | 0.93 ms |
-| 提示 1 x 1024 | 9.76 ms | 4.32 ms | 4.02 ms |
-| 提示 8 x 512 | 34.33 ms | 13.52 ms | 12.57 ms |
+| 场景 | `gpt2.py` FP16 | Triton | TileLang | CuTe DSL |
+| --- | --- | --- | --- | --- |
+| decode, 1 条序列, 16 + 256 | 1.05 ms | 0.86 ms | 0.85 ms | 0.82 ms |
+| decode, 8 条序列, 16 + 256 | 1.20 ms | 0.96 ms | 0.97 ms | 0.93 ms |
+| decode, 1 条序列, 768 + 128 | 1.19 ms | 0.98 ms | 0.93 ms | 0.89 ms |
+| 提示 1 x 128 | 2.21 ms | 1.23 ms | 1.14 ms | 1.10 ms |
+| 提示 1 x 1024 | 9.97 ms | 4.35 ms | 4.08 ms | 3.85 ms |
+| 提示 8 x 512 | 34.72 ms | 14.51 ms | 13.71 ms | 12.85 ms |
+
+CuTe DSL 与 TileLang 的差距主要来自 LayerNorm: CuTe DSL 把它折进 GEMM, decode 每步少 24 次内核启动; TileLang 保留 `gpt2.py` 的 FP16 舍入点, 每个 LayerNorm 单独运行一个内核. 长提示的注意力和 `attn_proj` 则是 TileLang 略快: 它的 K/V 流水线有两级缓冲, 尾处理直接从寄存器写出.
 
 精度: 以 FP32 的 `gpt2.py` 为基准, logits 的平均绝对误差小于 PyTorch 的 FP16 推理 (GPT-2 small: 0.023 对 0.032). 四种公开尺寸各用 2 条随机提示贪心生成 40 个 token, 结果与 FP32 逐 token 一致.
 

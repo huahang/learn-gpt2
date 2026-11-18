@@ -1131,15 +1131,18 @@ _DECODE_GEMMS = (
     _GemmTile(16, 32, 64, 6, 1, 2),
 )
 # Prompt pass: arithmetic bounds the speed. A larger tile reuses every loaded value in more
-# products, but needs enough tiles to fill the SMs. Entries are (tile, minimum CTAs per SM),
-# from the largest tile to the smallest.
+# products, but needs enough tiles to fill the SMs. The tiles run from the largest to the
+# smallest. The 128 x 128 tile has 8 warps while it makes at most 3 waves: the extra warps hide
+# load latency and share the epilogue. With more waves, 4 warps are slightly faster.
 _PROMPT_GEMMS = (
-    (_GemmTile(128, 128, 64, 3, 2, 2), 1.0),
-    (_GemmTile(128, 64, 64, 3, 2, 2), 1.0),
-    (_GemmTile(64, 64, 64, 4, 2, 2), 0.5),
-    (_GemmTile(32, 64, 64, 4, 1, 4), 0.0),
-    (_GemmTile(16, 64, 64, 4, 1, 4), 0.0),
+    _GemmTile(128, 128, 64, 3, 2, 4),
+    _GemmTile(64, 128, 64, 4, 2, 4),
+    _GemmTile(128, 64, 64, 3, 2, 2),
+    _GemmTile(64, 64, 64, 4, 2, 2),
+    _GemmTile(32, 64, 64, 4, 1, 4),
+    _GemmTile(16, 64, 64, 4, 1, 4),
 )
+_PROMPT_GEMM_MANY_WAVES = _GemmTile(128, 128, 64, 3, 2, 2)
 _DECODE_ATTENTION = _AttentionTile(16, 64, 1)
 _PROMPT_ATTENTION = _AttentionTile(64, 64, 4)
 
@@ -1157,12 +1160,18 @@ def _gemm_tile(rows: int, n: int, k: int, sm_count: int) -> _GemmTile:
             if n // tile.bn >= sm_count // 2:
                 return tile
         return max(fitting, key=lambda t: n // t.bn)
-    for tile, ctas_per_sm in _PROMPT_GEMMS:
-        if not tile.fits(n, k) or tile.bm > _next_power_of_two(rows):
-            continue
-        if math.ceil(rows / tile.bm) * (n // tile.bn) >= ctas_per_sm * sm_count:
+    fitting = [t for t in _PROMPT_GEMMS if t.fits(n, k) and t.bm <= _next_power_of_two(rows)]
+    if not fitting:
+        raise ValueError(f"No GEMM tile fits n={n}, k={k}")
+    for tile in fitting:
+        ctas = math.ceil(rows / tile.bm) * (n // tile.bn)
+        # Take the largest tile that gives half the SMs a CTA. Skip a tile that needs between
+        # one and two waves: its second wave leaves most SMs idle.
+        if ctas >= sm_count / 2 and not sm_count < ctas < 2 * sm_count:
+            if ctas > 3 * sm_count and tile == _PROMPT_GEMMS[0]:
+                return _PROMPT_GEMM_MANY_WAVES
             return tile
-    raise ValueError(f"No GEMM tile fits n={n}, k={k}")
+    return fitting[-1]
 
 
 @dataclass(frozen=True)
